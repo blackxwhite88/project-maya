@@ -2136,6 +2136,62 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         }
     };
 
+    // trace-nan (debug): STRATA_GLM_NAN_TRACE=1 - per layer, each seam's whole tensor: NaN/Inf counts, |x| > 65504
+    // (FP16 overflow), max |x| and the first bad (row, col)
+    static const bool nan_trace = getenv("STRATA_GLM_NAN_TRACE") != nullptr;
+    const auto nstat = [&](const char* what, int il, const void* p, int64_t rows, int64_t width, bool half) {
+        if (!nan_trace || p == nullptr) return;
+        cudaStreamSynchronize(s);
+        const int64_t n = rows * width;
+        std::vector<float> h((size_t) n);
+        if (half) {
+            std::vector<__half> hh((size_t) n);
+            cudaMemcpy(hh.data(), p, (size_t) n * 2, cudaMemcpyDeviceToHost);
+            for (int64_t i = 0; i < n; ++i) h[(size_t) i] = __half2float(hh[(size_t) i]);
+        } else {
+            cudaMemcpy(h.data(), p, (size_t) n * 4, cudaMemcpyDeviceToHost);
+        }
+        int64_t nn = 0, ni = 0, nb = 0, fb = -1;
+        float mx = 0.0f;
+        int64_t mxi = -1;
+        for (int64_t i = 0; i < n; ++i) {
+            const float v = h[(size_t) i];
+            if (std::isnan(v)) ++nn;
+            else if (std::isinf(v)) ++ni;
+            else {
+                if (std::fabs(v) > 65504.0f) ++nb;
+                if (std::fabs(v) > mx) { mx = std::fabs(v); mxi = i; }
+                continue;
+            }
+            if (fb < 0) fb = i;
+        }
+        std::fprintf(stderr, "NANTRACE CUDA%d p0=%lld L%02d %-9s %lldx%lld nan=%lld inf=%lld gt65504=%lld maxabs=%.5g@(%lld,%lld) "
+                             "firstbad=(%lld,%lld)\n", dev_, (long long) p0, il, what, (long long) rows, (long long) width,
+                     (long long) nn, (long long) ni, (long long) nb, mx, (long long) (mxi < 0 ? -1 : mxi / width),
+                     (long long) (mxi < 0 ? -1 : mxi % width), (long long) (fb < 0 ? -1 : fb / width),
+                     (long long) (fb < 0 ? -1 : fb % width));
+    };
+
+    // trace-nan: one expert lane's output rows, printed only when non-finite or |x| > 1e4
+    const auto nchk = [&](const char* what, int il, const float* d, int64_t rows, int64_t width, int ld, int a0, int a1) {
+        if (!nan_trace || d == nullptr || rows <= 0) return;
+        cudaStreamSynchronize(s);
+        std::vector<float> h((size_t) rows * (size_t) ld);
+        cudaMemcpy(h.data(), d, h.size() * 4, cudaMemcpyDeviceToHost);
+        int64_t nb = 0, br = -1;
+        float mx = 0.0f;
+        int64_t mr = -1;
+        for (int64_t r = 0; r < rows; ++r)
+            for (int64_t c = 0; c < width; ++c) {
+                const float v = h[(size_t) (r * ld + c)];
+                if (!std::isfinite(v)) { ++nb; if (br < 0) br = r; }
+                else if (std::fabs(v) > mx) { mx = std::fabs(v); mr = r; }
+            }
+        if (nb > 0 || mx > 1e4f)
+            std::fprintf(stderr, "NANLANE CUDA%d L%02d %-10s rows=%lld set[%d,%d) nonfinite=%lld (first row %lld) maxabs=%.5g (row %lld)\n",
+                         dev_, il, what, (long long) rows, a0, a1, (long long) nb, (long long) br, mx, (long long) mr);
+    };
+
     // ---- the disk reader: one thread for the chunk, reading the experts the MoE layers append - (layer, expert) in
     //      order - into the pinned landing ring, while the resident product and the RAM-tier groups run (Mercury,
     //      2.6k-token prompt: 5.1 -> 4.5 ms/token).  A layer appends its disk-only experts once its plan is known.
@@ -2474,6 +2530,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         // out through S->mixer, which this layer's mixer writes only after)
         dflash_capture(il, S->R, T, p0, S->mixer, T, s);
         dump_row("attn_norm-" + std::to_string(il), S->x, E);
+        nstat("R_in", il, S->R, T, 4 * E, false);
+        nstat("attn_x", il, S->x, T, E, false);
+        nstat("attn_x16", il, S->x16, T, E, true);
         // KV streaming: the layer's cache before the chunk, from its host copy into the staging copy (whole pages: a
         // chunk starting inside one finds it complete), which the chunk's rows are written into too and the attention
         // reads; the host copy and the resident slots get the chunk's rows as well (dsa_prep)
@@ -2714,9 +2773,13 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         S->mark(Ly.recr ? "kda" : "dsa", s);
         if (skip_output) continue;   // every KDA/DSA cache update above still ran; these output rows feed nothing
         dump_row("mixer-" + std::to_string(il), S->mixer, E);
+        nstat("mixer", il, S->mixer, T, E, false);
         hc_read(S->mixer, Ly.hc_ffn_fn, Ly.hc_ffn_scale, Ly.hc_ffn_base, Ly.ffn_norm);
         S->mark("hc", s);
         dump_row("ffn_norm-" + std::to_string(il), S->x, E);
+        nstat("R_mid", il, S->R, T, 4 * E, false);
+        nstat("ffn_x", il, S->x, T, E, false);
+        nstat("ffn_x16", il, S->x16, T, E, true);
         // the CPU lane's x (this layer's FFN input) goes down now, under the shared expert and the routing - not
         // after the plan, where the host's experts waited for it (~40 ms of a 16K chunk's 260 MB)
         bool x_down = false;
@@ -2754,6 +2817,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             }
             S->mark("dense_ffn", s);
             dump_row("ffn_out-" + std::to_string(il), S->ffn, E);
+            nstat("dffn_out", il, S->ffn, T, E, false);
             continue;
         }
 
@@ -2770,7 +2834,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             hgemm_q(Ly.sh_down, E, FF, M.sh16, FF, S->ffn + (size_t) t0 * E, E, tn, 0.0f);
         }
         S->mark("shexp", s);
+        nstat("shexp", il, S->ffn, T, E, false);
         sgemm_bf16(Ly.router, NE, E, S->x, E, M.logits, NE, T, 1.0f);
+        nstat("rlogits", il, M.logits, T, NE, false);
         gb::route(M.logits, Ly.router_bias, NE, K, g.w_scale, g.norm_w != 0, T, M.ids, M.rw, s);
         gb::expert_count(M.ids, T * K, NE, M.counts, M.rank, s);
         gb::copy_i32(M.counts, S->h_counts, NE, s);   // (not a copy: the engine may be busy with x, x_down)
@@ -3313,6 +3379,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                             wmma_fell_back = true;
                             std::fprintf(stderr, "glm prefill: grouped WMMA rejected the gate/up shape, MMQ from here\n");
                         } else {
+                            nchk("wmma_gu", il, GU, nrows, 2 * nff, 2 * nff, i0, i1);
                             gb::swiglu_rows_h16(GU, h16 + (size_t) a * nff, nrows, nff, g.swiglu_exp, s);
                             if (!strata::kernels::gemm_iq_f16_grouped(Ly.d_type, wbase + (size_t) i0 * stride + Ly.down_off,
                                     stride, E, nff, h16, nff, d_bounds + i0, i1 - i0, max_rows,
@@ -3320,6 +3387,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                                 wmma_fell_back = true;
                                 std::fprintf(stderr, "glm prefill: grouped WMMA rejected the down shape, MMQ from here\n");
                             } else {
+                                nchk("wmma_out", il, M.OUTP + (size_t) o * E, nrows, E, E, i0, i1);
                                 S->mark("moe_wmma", s);
                                 i0 = i1;
                                 continue;
@@ -3347,6 +3415,14 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         S->mq->run(gu, s);
                         gb::swiglu_rows(GU, GU, nrows, nff, g.swiglu_exp, s, 2 * nff);   // (in place: no T x K x n_ff buffer)
                     }
+                    nchk(glu ? "mmq_h" : "mmq_h_sw", il, GU, nrows, nff, 2 * nff, i0, i1);
+                    std::vector<float> tr_h;
+                    static const bool tr_href = getenv("STRATA_GLM_NAN_HREF") != nullptr;
+                    if (nan_trace && tr_href) {
+                        cudaStreamSynchronize(s);
+                        tr_h.resize((size_t) nrows * 2 * nff);
+                        cudaMemcpy(tr_h.data(), GU, tr_h.size() * 4, cudaMemcpyDeviceToHost);
+                    }
                     mmq::quantize(GU, nullptr, M.Hq, Ly.d_type, nff, 2 * nff, nrows, s);
                     mmq::Product dn;
                     dn.w = wbase + (size_t) i0 * stride + Ly.down_off;
@@ -3363,6 +3439,106 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     dn.dst = M.OUTP + (size_t) (o - a) * E;
                     dn.ld_dst = E;
                     S->mq->run(dn, s);
+                    nchk("mmq_out", il, M.OUTP + (size_t) o * E, nrows, E, E, i0, i1);
+                    if (nan_trace) {   // trace-nan: the first bad row against a host reference, then the same product again
+                        std::vector<float> out((size_t) nrows * E);
+                        cudaMemcpy(out.data(), M.OUTP + (size_t) o * E, out.size() * 4, cudaMemcpyDeviceToHost);
+                        int bad_r = -1, n_bad_rows = 0;
+                        for (int r = 0; r < nrows; ++r) {
+                            bool b = false;
+                            for (int c = 0; c < E; ++c) {
+                                const float v = out[(size_t) r * E + c];
+                                if (!std::isfinite(v) || std::fabs(v) > 1e4f) { b = true; break; }
+                            }
+                            if (b) { ++n_bad_rows; if (bad_r < 0) bad_r = r; }
+                        }
+                        if (bad_r >= 0) {
+                            std::string per;
+                            for (int r = 0; r < nrows; ++r) {
+                                bool b = false;
+                                for (int c = 0; c < E && !b; ++c) {
+                                    const float v = out[(size_t) r * E + c];
+                                    b = !std::isfinite(v) || std::fabs(v) > 1e4f;
+                                }
+                                if (!b) continue;
+                                int ei = i0;
+                                while (ei + 1 < i1 && hb[ei + 1] <= a + r) ++ei;
+                                per += " r" + std::to_string(r) + "/e" + std::to_string(ei) + "(" + std::to_string(hb[ei + 1] - hb[ei]) + "rows)";
+                            }
+                            int ei = i0;
+                            while (ei + 1 < i1 && hb[ei + 1] <= a + bad_r) ++ei;
+                            const uint8_t* wd = wbase + (size_t) ei * stride + Ly.down_off;
+                            const size_t rb = ggml_row_size((ggml_type) Ly.d_type, nff);
+                            std::vector<uint8_t> wq(rb * (size_t) E);
+                            const cudaError_t ce = cudaMemcpy(wq.data(), wd, wq.size(), cudaMemcpyDefault);
+                            const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) Ly.d_type);
+                            std::vector<float> wrow((size_t) nff);
+                            int64_t wnf = 0;
+                            double ref_max = 0, gpu_max = 0, diff_max = 0;
+                            int ref_nf = 0, gpu_nf = 0;
+                            if (tr_h.empty()) tr_h.assign((size_t) nrows * 2 * nff, 0.0f);
+                            const float* hr = tr_h.data() + (size_t) bad_r * 2 * nff;
+                            float hmax = 0, wmax = 0;
+                            for (int k = 0; k < nff; ++k) hmax = std::max(hmax, std::fabs(hr[k]));
+                            for (int c = 0; c < E; ++c) {
+                                tt->to_float(wq.data() + (size_t) c * rb, wrow.data(), nff);
+                                double acc = 0;
+                                for (int k = 0; k < nff; ++k) {
+                                    if (!std::isfinite(wrow[(size_t) k])) ++wnf;
+                                    else wmax = std::max(wmax, std::fabs(wrow[(size_t) k]));
+                                    acc += (double) wrow[(size_t) k] * hr[k];
+                                }
+                                if (!std::isfinite(acc)) ++ref_nf; else ref_max = std::max(ref_max, std::fabs(acc));
+                                const float gv = out[(size_t) bad_r * E + c];
+                                if (!std::isfinite(gv)) ++gpu_nf;
+                                else { gpu_max = std::max(gpu_max, (double) std::fabs(gv)); diff_max = std::max(diff_max, std::fabs(gv - acc)); }
+                            }
+                            std::fprintf(stderr, "NANREF CUDA%d L%02d set[%d,%d) a=%d nrows=%d max_rows=%d bad_rows=%d:%s\n", dev_, il, i0, i1, a,
+                                         nrows, max_rows, n_bad_rows, per.c_str());
+                            std::fprintf(stderr, "NANREF CUDA%d L%02d row %d expert-in-set %d (rows %d): d_type %s (%d) copy=%s w_nonfinite=%lld "
+                                         "|w|max=%.4g |h|max=%.4g  host ref: max %.5g nonfinite %d | gpu: max %.5g nonfinite %d | max |gpu-ref| (finite) %.5g\n",
+                                         dev_, il, bad_r, ei, hb[ei + 1] - hb[ei], ggml_type_name((ggml_type) Ly.d_type), Ly.d_type,
+                                         cudaGetErrorString(ce), (long long) wnf, wmax, hmax, ref_max, ref_nf, gpu_max, gpu_nf, diff_max);
+                            {
+                                const size_t w0 = (size_t) wd, xp = (size_t) F->xpool, rg = (size_t) S->region;
+                                const auto& P = F->lp[(size_t) il];
+                                int slot = -1;
+                                for (int q = 0; q < P.n; ++q)
+                                    if ((size_t) P.slot_ptr(q) <= (size_t) (wbase + (size_t) ei * stride) &&
+                                        (size_t) (wbase + (size_t) ei * stride) < (size_t) P.slot_ptr(q) + Ly.blob) slot = q;
+                                std::fprintf(stderr, "NANADDR CUDA%d L%02d expert blob %p (down at +%zu, stride %zu, blob %zu) slot %d of n_main %d n %d "
+                                             "st %d key %d | xpool %p +%zu MB, region %p need %zu MB (region-xpool %lld MB), lend_end-xpool %lld MB, "
+                                             "blob-xpool %lld MB, blob-region %lld MB\n",
+                                             dev_, il, (void*) (wbase + (size_t) ei * stride), (size_t) Ly.down_off, stride, (size_t) Ly.blob, slot,
+                                             P.n_main, P.n, slot >= 0 ? (int) P.st[(size_t) slot] : -9, slot >= 0 ? P.key[(size_t) slot] : -9,
+                                             (void*) F->xpool, F->xpool_bytes >> 20, (void*) S->region, S->need >> 20,
+                                             (long long) ((long long) rg - (long long) xp) / 1048576, (long long) ((long long) F->lend_end - (long long) xp) / 1048576,
+                                             (long long) ((long long) w0 - (long long) xp) / 1048576, (long long) ((long long) w0 - (long long) rg) / 1048576);
+                            }
+                            {   // trace-nan: the slot's whole blob, twice (does it change under us?)
+                                const uint8_t* bp = wbase + (size_t) ei * stride;
+                                std::vector<uint8_t> b1((size_t) Ly.blob), b2((size_t) Ly.blob);
+                                cudaMemcpy(b1.data(), bp, b1.size(), cudaMemcpyDefault);
+                                cudaDeviceSynchronize();
+                                cudaMemcpy(b2.data(), bp, b2.size(), cudaMemcpyDefault);
+                                size_t ndiff = 0;
+                                for (size_t q = 0; q < b1.size(); ++q) ndiff += b1[q] != b2[q];
+                                const std::string fn = "/tmp/maya-trace-slot-L" + std::to_string(il) + "-e" +
+                                                       std::to_string(F->lp[(size_t) il].key[0] >= -1 ? 0 : 0) + ".bin";
+                                char nm[160];
+                                std::snprintf(nm, sizeof nm, "/tmp/maya-trace-slot-CUDA%d-L%02d-p%lld-ei%d.bin", dev_, il, (long long) p0, ei);
+                                if (FILE* fo = std::fopen(nm, "wb")) { std::fwrite(b1.data(), 1, b1.size(), fo); std::fclose(fo); }
+                                std::fprintf(stderr, "NANBLOB %s: %zu bytes, %zu differ between two reads\n", nm, b1.size(), ndiff);
+                                (void) fn;
+                            }
+                            // the same down product again over the same Hq
+                            S->mq->run(dn, s);
+                            nchk("mmq_rerun", il, M.OUTP + (size_t) o * E, nrows, E, E, i0, i1);
+                            // and the gate/up type, for the record
+                            std::fprintf(stderr, "NANREF CUDA%d L%02d gu_type %s glu=%d wmma=%d\n", dev_, il,
+                                         ggml_type_name((ggml_type) Ly.gu_type), (int) glu, (int) wmma);
+                        }
+                    }
                 }
                 i0 = i1;
             }
@@ -3904,6 +4080,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         S->mark("moe_staged", s);
         dump_row("pf_shexp-" + std::to_string(il), S->ffn, E);
         flush();
+        if (cpu_nrows > 0) nchk("cpu_out", il, M.OUTPc, cpu_nrows, E, E, cpu_r0, cpu_r0 + cpu_nrows);
         if (cpu_nrows > 0)
             gb::moe_combine_add(M.OUTPc, cpu_r0, cpu_r0, cpu_r0 + cpu_nrows, M.pos, M.rw, T, K, E, S->ffn, s);
         S->mark("combine", s);
@@ -3972,6 +4149,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         }
         if (S->trace) cudaEventRecord(S->tr[(size_t) il].end, s);
         dump_row("ffn_out-" + std::to_string(il), S->ffn, E);
+        nstat("ffn_out", il, S->ffn, T, E, false);
         if (glmfast::prefill_submit()) glmfast::submit_queued(s);   // (Windows HIP: the experts start now)
     }
     // the last layer's write half: R = post x ffn + comb . R
