@@ -50,6 +50,21 @@
 #include <thread>
 #include <vector>
 #include <bit>
+
+// STRATA_GLM_VRAM_GB=<n> caps every device; =<n0>,<n1>,... caps each device by its CUDA ordinal (0 or an empty
+// entry: no cap) - a card with a bad VRAM region keeps its pool below it while the others fill theirs
+static double vram_cap_gb(const char* vc) {
+    if (vc == nullptr) return 0.0;
+    if (std::strchr(vc, ',') == nullptr) return std::atof(vc);
+    int dev = 0;
+    cudaGetDevice(&dev);
+    const char* q = vc;
+    for (int i = 0; i < dev && q != nullptr; ++i) {
+        q = std::strchr(q, ',');
+        if (q != nullptr) ++q;
+    }
+    return q != nullptr ? std::atof(q) : 0.0;
+}
 #ifndef _WIN32
 #include <unistd.h>
 #else
@@ -1149,8 +1164,8 @@ bool Glm5Model::fast_setup(std::string& err) {
             avail = std::min(avail, (size_t) (std::atof(cap) * 1073741824.0));
         // STRATA_GLM_VRAM_GB=<n>: behave like a card with n GB - the cap counts everything this process already
         // holds on the device (context, dense weights, state, arenas), so the pool gets what such a card would have
-        if (const char* vc = getenv("STRATA_GLM_VRAM_GB")) {
-            const size_t cap = (size_t) (std::atof(vc) * 1073741824.0);
+        if (const double vg = vram_cap_gb(getenv("STRATA_GLM_VRAM_GB")); vg > 0) {
+            const size_t cap = (size_t) (vg * 1073741824.0);
             const size_t used = total_b - free_b;
             const size_t room = cap > used + reserve ? cap - used - reserve : 0;
             std::fprintf(stderr, "glm fast: CUDA%d VRAM cap %.1f GB: %.2f GB already in use, %.2f GB left for experts\n",
@@ -6089,8 +6104,8 @@ Glm5Model::PoolBudget Glm5Model::pool_budget(size_t free_b, size_t total_b, int 
 
     if (const char* cap = getenv("STRATA_GLM_POOL_GB"))
         b.avail = std::min(b.avail, (size_t) (std::atof(cap) * 1073741824.0));
-    if (const char* vc = getenv("STRATA_GLM_VRAM_GB")) {
-        const size_t cap = (size_t) (std::atof(vc) * 1073741824.0);
+    if (const double vg = vram_cap_gb(getenv("STRATA_GLM_VRAM_GB")); vg > 0) {
+        const size_t cap = (size_t) (vg * 1073741824.0);
         const size_t used = total_b - free_b;
         b.avail = std::min(b.avail, cap > used + b.reserve ? cap - used - b.reserve : (size_t) 0);
     }
